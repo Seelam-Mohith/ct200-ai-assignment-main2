@@ -120,3 +120,22 @@ def changes(node_id: int, s: Session = Depends(db)):
             e.update(changed_from_previous=True, diff=_summ(prev.body, node.body))
         out.append(e); prev = node
     return dict(logical_id=n.logical_id, changed_ever=any(e["changed_from_previous"] for e in out), versions=out)
+
+# ---------- selections ----------
+class SelIn(BaseModel):
+    name: str
+    node_ids: list[int]
+
+@app.post("/selections", status_code=201)
+def create_sel(b: SelIn, s: Session = Depends(db)):
+    if not b.node_ids: raise HTTPException(422, "empty selection")
+    for i in set(b.node_ids):
+        if not s.get(Node, i): raise HTTPException(404, f"node {i} not found")
+    sel = Selection(name=b.name, items=[SelectionItem(node_id=i) for i in sorted(set(b.node_ids))])
+    s.add(sel); s.commit()
+    return dict(id=sel.id, name=sel.name, node_ids=sorted(set(b.node_ids)))
+
+def _sel_nodes(s, sid):
+    sel = s.get(Selection, sid)
+    if not sel: raise HTTPException(404, "selection not found")
+    return sel, [s.get(Node, it.node_id) for it in sel.items]
