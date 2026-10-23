@@ -1,10 +1,11 @@
-import os
+import difflib, os
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 from .models import *
 from .parser import parse
+from .staleness import numbers
 from .versioning import match
 
 app = FastAPI(title="CT-200 manual API")
@@ -73,3 +74,49 @@ def ingest(body: IngestIn, s: Session = Depends(db)):
                 changed=[r.number for r in rows if r.logical_id in prev_hash and prev_hash[r.logical_id] != r.hash],
                 fuzzy_matched=[r.number for r in rows if r.match_method == "fuzzy"],
                 warnings={r.number: r.warnings for r in rows if r.warnings})
+
+# ---------- browse ----------
+@app.get("/versions")
+def versions(s: Session = Depends(db)):
+    return [dict(number=v.number, id=v.id, created=v.created) for v in s.scalars(select(Version))]
+
+@app.get("/sections")
+def sections(version: int | None = None, s: Session = Depends(db)):
+    v = get_version(s, version)
+    rows = s.scalars(select(Node).where(Node.version_id == v.id, Node.parent_id.is_(None)).order_by(Node.id)).all()
+    return dict(version=v.number, sections=[node_out(r, full=False) for r in rows])
+
+@app.get("/nodes/{node_id}")
+def get_node(node_id: int, s: Session = Depends(db)):
+    n = s.get(Node, node_id)
+    if not n: raise HTTPException(404)
+    kids = s.scalars(select(Node).where(Node.parent_id == n.id).order_by(Node.id)).all()
+    return node_out(n, kids)
+
+@app.get("/search")
+def search(q: str, version: int | None = None, s: Session = Depends(db)):
+    v = get_version(s, version); like = f"%{q}%"
+    rows = s.scalars(select(Node).where(Node.version_id == v.id,
+            or_(Node.heading.ilike(like), Node.body.ilike(like))).order_by(Node.id)).all()
+    return dict(version=v.number, results=[node_out(r, full=False) for r in rows])
+
+def _summ(old: str, new: str):
+    d = [l for l in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0)
+         if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+    return dict(lines_removed=[l[1:] for l in d if l[0] == "-"][:5],
+                lines_added=[l[1:] for l in d if l[0] == "+"][:5],
+                numbers_before=numbers(old), numbers_after=numbers(new))
+
+@app.get("/nodes/{node_id}/changes")
+def changes(node_id: int, s: Session = Depends(db)):
+    n = s.get(Node, node_id)
+    if not n: raise HTTPException(404)
+    hist = s.execute(select(Node, Version.number).join(Version, Version.id == Node.version_id)
+                     .where(Node.logical_id == n.logical_id).order_by(Version.number)).all()
+    out, prev = [], None
+    for node, vn in hist:
+        e = dict(version=vn, node_id=node.id, hash=node.hash, changed_from_previous=False)
+        if prev and prev.hash != node.hash:
+            e.update(changed_from_previous=True, diff=_summ(prev.body, node.body))
+        out.append(e); prev = node
+    return dict(logical_id=n.logical_id, changed_ever=any(e["changed_from_previous"] for e in out), versions=out)
