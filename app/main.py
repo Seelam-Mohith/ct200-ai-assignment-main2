@@ -1,11 +1,13 @@
-import difflib, os
+import difflib, hashlib, os
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, or_
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
+from . import store
+from .llm import generate
 from .models import *
 from .parser import parse
-from .staleness import numbers
+from .staleness import classify, worst, numbers
 from .versioning import match
 
 app = FastAPI(title="CT-200 manual API")
@@ -139,3 +141,57 @@ def _sel_nodes(s, sid):
     sel = s.get(Selection, sid)
     if not sel: raise HTTPException(404, "selection not found")
     return sel, [s.get(Node, it.node_id) for it in sel.items]
+
+# ---------- generation ----------
+def _key(nodes): return hashlib.sha256("|".join(sorted(n.hash for n in nodes)).encode()).hexdigest()
+
+@app.post("/selections/{sid}/generate")
+def gen(sid: int, force: bool = False, s: Session = Depends(db)):
+    """Policy: same selection content (same set of node hashes) => return the stored
+    successful generation; no LLM call. ?force=true creates a new one. Failed
+    generations never block a retry."""
+    sel, nodes = _sel_nodes(s, sid)
+    key = _key(nodes)
+    if not force:
+        for g in store.all_docs():
+            if g["selection_id"] == sid and g["content_key"] == key and g["status"] == "ok":
+                return _view(s, g) | {"reused": True}
+    text = "\n\n".join(f"[{n.number}] {n.heading}\n{n.body}" for n in nodes)
+    result, log = generate(text, {n.number for n in nodes})
+    g = dict(selection_id=sid, content_key=key, attempts=log,
+             status="ok" if result else "failed",
+             test_cases=[t.model_dump() for t in result.test_cases] if result else [],
+             sources=[dict(node_id=n.id, logical_id=n.logical_id, number=n.number,
+                           hash=n.hash, body_snapshot=n.body) for n in nodes])
+    store.save(g)
+    return _view(s, g) | {"reused": False}
+
+def _view(s: Session, g: dict) -> dict:
+    """Retrieval-time staleness: compare each source's hash with the LATEST version's
+    node that shares its logical_id."""
+    lv = latest_version(s)
+    per = {}
+    for src in g["sources"]:
+        cur = s.scalars(select(Node).where(Node.version_id == lv.id, Node.logical_id == src["logical_id"])).first()
+        per[src["number"]] = classify(src["body_snapshot"], src["hash"], cur.body if cur else None,
+                                      cur.hash if cur else None) | {"current_node_id": cur.id if cur else None}
+    tcs = []
+    for tc in g["test_cases"]:
+        refs = [per[x] for x in tc["source_sections"] if x in per] or list(per.values())
+        sev = worst(refs)
+        tcs.append(tc | {"staleness": "fresh" if sev == "none" else "stale", "severity": sev})
+    return dict(id=g["id"], selection_id=g["selection_id"], status=g["status"], attempts=g["attempts"],
+                overall_severity=worst(list(per.values())), source_status=per, test_cases=tcs,
+                latest_version=lv.number)
+
+@app.get("/selections/{sid}/testcases")
+def sel_tc(sid: int, s: Session = Depends(db)):
+    _sel_nodes(s, sid)
+    return [_view(s, g) for g in store.all_docs() if g["selection_id"] == sid]
+
+@app.get("/nodes/{node_id}/testcases")
+def node_tc(node_id: int, s: Session = Depends(db)):
+    n = s.get(Node, node_id)
+    if not n: raise HTTPException(404)
+    return [_view(s, g) for g in store.all_docs()
+            if any(x["logical_id"] == n.logical_id for x in g["sources"])]
