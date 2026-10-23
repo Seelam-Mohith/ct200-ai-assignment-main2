@@ -11,8 +11,8 @@ HEAD = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(\S.*)$")
 LIST = re.compile(r"^\d+\.\s")
 
 def norm(t: str) -> str:
-    t = unicodedata.normalize("NFKC", t)  # ligatures ï¬/ï¬€/ï¬‚ -> fi/ff/fl
-    t = t.replace("â€‘", "-").replace("â€", "-")  # non-breaking hyphen
+    t = unicodedata.normalize("NFKC", t)  # ligatures ﬁ/ﬀ/ﬂ -> fi/ff/fl
+    t = t.replace("‑", "-").replace("‐", "-")  # non-breaking hyphen
     return re.sub(r"[ \t]+", " ", t).strip()
 
 def content_hash(body: str) -> str:
@@ -52,9 +52,20 @@ def parse(pdf_path: str):
             num, head = m.groups(); level = num.count(".") + 1
             while stack[-1].level >= level: stack.pop()
             parent = stack[-1]; n = Node(num, head, level, pn, parent=parent)
+            if parent.level != level - 1 and parent is not root:
+                n.warnings.append(f"skipped_level: parent {parent.number} -> {num}")
+            if parent is root and level > 1:
+                n.warnings.append("orphan: no ancestor heading")
+            if last and _key(num) < _key(last.number):
+                n.warnings.append(f"out_of_order: {num} after {last.number}")
             parent.children.append(n); stack.append(n); nodes.append(n); last = n
             n.path = (parent.path + "/" if parent.path else "") + f"{num} {head}"
         elif nodes:
             nodes_cur = stack[-1]
             nodes_cur.body_lines.append(text)
+    for n in nodes:  # tables / lists detected structurally, kept in body
+        if "Code\nMeaning\nDevice Behavior" in n.body:
+            n.warnings.append("table_present: rows kept as flat text; cell grouping unsupported")
     return " ".join(title), root, nodes
+
+def _key(num): return tuple(int(x) for x in num.split("."))
