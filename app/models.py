@@ -40,4 +40,17 @@ class Node(Base):
     warnings: Mapped[list] = mapped_column(JSON, default=list)
     match_method: Mapped[str] = mapped_column(String, default="new")  # new|path|fuzzy
 
+class Selection(Base):
+    __tablename__ = "selections"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    items = relationship("SelectionItem", cascade="all, delete-orphan")
+
+class SelectionItem(Base):
+    __tablename__ = "selection_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    selection_id: Mapped[int] = mapped_column(ForeignKey("selections.id"))
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"))  # node row == node+version pair
+
 def init_db(): Base.metadata.create_all(engine)
