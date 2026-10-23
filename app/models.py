@@ -21,4 +21,23 @@ class Version(Base):
     title: Mapped[str] = mapped_column(String, default="")
     created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
+class Node(Base):
+    """One row per node PER VERSION. Rows are never updated after ingest, so a
+    node id always resolves to the exact text it had (this is the version pin).
+    logical_id ties together 'the same section' across versions."""
+    __tablename__ = "nodes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version_id: Mapped[int] = mapped_column(ForeignKey("versions.id"), index=True)
+    logical_id: Mapped[str] = mapped_column(String, index=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True)
+    number: Mapped[str]
+    heading: Mapped[str]
+    level: Mapped[int]
+    path: Mapped[str]
+    page: Mapped[int]
+    body: Mapped[str] = mapped_column(Text)
+    hash: Mapped[str] = mapped_column(String)
+    warnings: Mapped[list] = mapped_column(JSON, default=list)
+    match_method: Mapped[str] = mapped_column(String, default="new")  # new|path|fuzzy
+
 def init_db(): Base.metadata.create_all(engine)
